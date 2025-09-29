@@ -13,11 +13,12 @@ from scipy.stats import skew, kurtosis
 import csv
 
 # ---------------- CONFIG ----------------
-SERIAL_PORT = "/dev/cu.usbserial-0289714A"
+SERIAL_PORT = "/dev/cu.usbserial-0289722F"
 BAUDRATE = 115200
 MAX_BUFFER_LINES = 5000
-SEGMENT_SIZE = 200
+SEGMENT_SIZE = 100
 THRESHOLD = 50
+CONFIDENCE_THRESHOLD = 0.1  # <--- NEW
 
 serial_lock = threading.Lock()
 
@@ -68,6 +69,7 @@ def extract_features_segment(gas_arr):
     drop_rate = drop_magnitude / drop_duration_s if drop_duration_s > 0 else 0
     recovery_rate = (y[recovery_end_idx] - min_val) / recovery_duration_s if recovery_duration_s > 0 else 0
 
+    # use numpy trapezoid (replacement for np.trapz deprecation)
     drop_area = float(np.trapezoid(baseline_mean - y[drop_start_idx:min_idx + 1], t[drop_start_idx:min_idx + 1])) if min_idx > 0 else 0
     recovery_area = float(np.trapezoid(y[min_idx:recovery_end_idx + 1] - min_val, t[min_idx:recovery_end_idx + 1])) if recovery_end_idx > min_idx else 0
 
@@ -115,7 +117,23 @@ def serial_reader():
 
             # Append to segment buffer
             segment_buffer[sensor_id].append(gas_resistance)
+
+            # --- IMPORTANT: always append raw reading to serial_buffer for plotting ---
+            with serial_lock:
+                serial_buffer[sensor_id].append({
+                    "millis": millis,
+                    "gas_resistance": gas_resistance
+                })
+                # append a prediction placeholder row (will be updated later when prediction occurs)
+                predictions_buffer[sensor_id].append({
+                    "millis": millis,
+                    "prediction": current_prediction[sensor_id] if current_prediction[sensor_id] else "None"
+                })
+
+            # If not enough samples yet, skip prediction but keep logged data
             if len(segment_buffer[sensor_id]) < SEGMENT_SIZE:
+                # you can uncomment next line for debug, but avoid flooding the console
+                # print(f"[{sensor_id}] waiting for {SEGMENT_SIZE} samples (have {len(segment_buffer[sensor_id])})")
                 continue
 
             # Extract features
@@ -123,10 +141,15 @@ def serial_reader():
             features = extract_features_segment(gas_arr)
 
             # Predict
-            pred_label = rf_model.predict(features)[0]
-            raw_confidence = float(np.max(rf_model.predict_proba(features)[0])) if hasattr(rf_model, "predict_proba") else 1.0
+            try:
+                pred_label = rf_model.predict(features)[0]
+                raw_confidence = float(np.max(rf_model.predict_proba(features)[0])) if hasattr(rf_model, "predict_proba") else 1.0
+            except Exception as e:
+                print("[serial_reader] Prediction error:", e)
+                pred_label = None
+                raw_confidence = 0.0
 
-            # Threshold logic
+            # Threshold logic (keep last_raw_prediction, streak, only update when streak >= THRESHOLD and confidence >= CONFIDENCE_THRESHOLD)
             if last_raw_prediction[sensor_id] == pred_label:
                 prediction_streak[sensor_id] += 1
             else:
@@ -134,16 +157,14 @@ def serial_reader():
                 last_raw_prediction[sensor_id] = pred_label
 
             if prediction_streak[sensor_id] >= THRESHOLD:
-                current_prediction[sensor_id] = pred_label
-                current_confidence[sensor_id] = raw_confidence
+                if raw_confidence >= CONFIDENCE_THRESHOLD and pred_label is not None:
+                    current_prediction[sensor_id] = pred_label
+                    current_confidence[sensor_id] = raw_confidence
+                # reset streak regardless so we don't constantly trigger
                 prediction_streak[sensor_id] = 0
 
-            # Store for plotting
+            # Store updated prediction in predictions_buffer (so UI can read it)
             with serial_lock:
-                serial_buffer[sensor_id].append({
-                    "millis": millis,
-                    "gas_resistance": gas_resistance
-                })
                 predictions_buffer[sensor_id].append({
                     "millis": millis,
                     "prediction": current_prediction[sensor_id] if current_prediction[sensor_id] else "None"
@@ -166,7 +187,8 @@ def serial_reader():
                 writer = csv.DictWriter(f, fieldnames=csv_columns)
                 writer.writerow(row)
 
-            print(f"[{sensor_id}] RAW={pred_label} | CURRENT={current_prediction[sensor_id]} (conf={current_confidence[sensor_id]:.2f})")
+            print(f"[{sensor_id}] RAW={pred_label} | CURRENT={current_prediction[sensor_id]} "
+                  f"(conf={current_confidence[sensor_id] if current_confidence[sensor_id] else 0:.2f})")
 
         except Exception as e:
             print("[serial_reader] Error:", e)
@@ -224,7 +246,8 @@ def update_dashboard(n):
     fig = make_subplots(rows=rows, cols=cols, subplot_titles=[f"Sensor {sid}" for sid in sensor_ids])
     for idx, sid in enumerate(sensor_ids):
         df = dfs[sid]
-        if df.empty: continue
+        if df.empty:
+            continue
         df["timestamp"] = start_time + pd.to_timedelta(df["millis"], unit="ms")
         row = idx//cols + 1
         col = idx%cols + 1

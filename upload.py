@@ -553,8 +553,8 @@ def export_metrics(n_clicks, stored_selected, dropdown_options, curve_label):
 
         drop_rate = (baseline_mean - min_val) / drop_duration_s if drop_duration_s > 0 else np.nan
         recovery_rate = (y[recovery_end_idx] - min_val) / recovery_duration_s if recovery_duration_s > 0 else np.nan
-        drop_area = float(np.trapz(baseline_mean - y[drop_start_idx:min_idx + 1], t[drop_start_idx:min_idx + 1]))
-        recovery_area = float(np.trapz(y[min_idx:recovery_end_idx + 1] - min_val, t[min_idx:recovery_end_idx + 1]))
+        drop_area = float(np.trapezoid(baseline_mean - y[drop_start_idx:min_idx + 1], t[drop_start_idx:min_idx + 1]))
+        recovery_area = float(np.trapezoid(y[min_idx:recovery_end_idx + 1] - min_val, t[min_idx:recovery_end_idx + 1]))
 
         # --- new: curve shape metrics ---
         skewness = float(pd.Series(y).skew())
@@ -581,6 +581,7 @@ def export_metrics(n_clicks, stored_selected, dropdown_options, curve_label):
     if not rows_to_export:
         return "No data to export."
 
+    print(row)
     df_export = pd.DataFrame(rows_to_export)
 
     file_exists = os.path.isfile("data.csv")
