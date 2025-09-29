@@ -11,23 +11,35 @@ from datetime import datetime
 import joblib
 from scipy.stats import skew, kurtosis
 import csv
+import numpy as np
+import pandas as pd
 
 # ---------------- CONFIG ----------------
-SERIAL_PORT = "/dev/cu.usbserial-0289714A"
+SERIAL_PORT = "/dev/cu.usbserial-0289722F"
 BAUDRATE = 115200
 MAX_BUFFER_LINES = 5000
-SEGMENT_SIZE = 200
+SEGMENT_SIZE = 20
 THRESHOLD = 50
+CONFIDENCE_THRESHOLD = 0.6  
+DROP_THRESHOLD_PERCENT = 0.1
+
+POST_BASELINE_POINTS = 100  # number of points to continue prediction after baseline
+# How many points to wait before starting prediction
+PREDICTION_START_SEGMENTS = 20
 
 serial_lock = threading.Lock()
 
 # Buffers per sensor ID
+post_baseline_counter = defaultdict(int)
 serial_buffer = defaultdict(lambda: deque(maxlen=MAX_BUFFER_LINES))
 segment_buffer = defaultdict(lambda: deque(maxlen=SEGMENT_SIZE))
 predictions_buffer = defaultdict(lambda: deque(maxlen=MAX_BUFFER_LINES))
 current_prediction = defaultdict(lambda: None)
 current_confidence = defaultdict(lambda: None)
-
+collecting_segment = defaultdict(lambda: False)
+segment_values = defaultdict(list)
+baseline_value = defaultdict(lambda: None)
+drop_start_value = defaultdict(lambda: None)
 last_raw_prediction = defaultdict(lambda: None)
 prediction_streak = defaultdict(int)
 
@@ -47,39 +59,69 @@ with open(csv_file, mode="w", newline="") as f:
     writer = csv.DictWriter(f, fieldnames=csv_columns)
     writer.writeheader()
 
-# ---------------- HELPER FUNCTIONS ----------------
+
+
+
 def extract_features_segment(gas_arr):
     y = np.array(gas_arr, dtype=float)
-    t = np.arange(len(y))
 
+    # Defensive: avoid empty arrays
+    if len(y) == 0:
+        return np.zeros((1, 12))
+
+    # Time vector (in samples, not ms)
+    t = np.arange(len(y), dtype=float)
+
+    # Baseline = mean of first 5 points (or fewer if short)
     baseline_vals = y[:min(5, len(y))]
     baseline_mean = float(np.mean(baseline_vals)) if len(baseline_vals) > 0 else float(y[0])
 
+    # Drop phase
     min_idx = int(np.argmin(y))
     min_val = float(y[min_idx])
     drop_magnitude = baseline_mean - min_val
     drop_start_idx = 0
     drop_duration_s = float(max(0.0, t[min_idx] - t[drop_start_idx]))
 
+    # Recovery phase
     recovery_end_idx = len(y) - 1
     recovery_duration_s = float(max(0.0, t[recovery_end_idx] - t[min_idx]))
     total_response_time_s = float(max(0.0, t[recovery_end_idx] - t[drop_start_idx]))
 
-    drop_rate = drop_magnitude / drop_duration_s if drop_duration_s > 0 else 0
-    recovery_rate = (y[recovery_end_idx] - min_val) / recovery_duration_s if recovery_duration_s > 0 else 0
+    # Rates
+    drop_rate = drop_magnitude / drop_duration_s if drop_duration_s > 0 else 0.0
+    recovery_rate = (y[recovery_end_idx] - min_val) / recovery_duration_s if recovery_duration_s > 0 else 0.0
 
-    drop_area = float(np.trapezoid(baseline_mean - y[drop_start_idx:min_idx + 1], t[drop_start_idx:min_idx + 1])) if min_idx > 0 else 0
-    recovery_area = float(np.trapezoid(y[min_idx:recovery_end_idx + 1] - min_val, t[min_idx:recovery_end_idx + 1])) if recovery_end_idx > min_idx else 0
+    # Areas (be explicit with x= to avoid misinterpretation in np.trapezoid)
+    drop_area = 0.0
+    if min_idx > 0:
+        drop_area = float(np.trapezoid(
+            baseline_mean - y[drop_start_idx:min_idx + 1],
+            x=t[drop_start_idx:min_idx + 1]
+        ))
 
-    skewness = float(pd.Series(y).skew())
-    kurt = float(pd.Series(y).kurtosis())
+    recovery_area = 0.0
+    if recovery_end_idx > min_idx:
+        recovery_area = float(np.trapezoid(
+            y[min_idx:recovery_end_idx + 1] - min_val,
+            x=t[min_idx:recovery_end_idx + 1]
+        ))
 
-    features = np.array([[baseline_mean, min_val, drop_magnitude, drop_duration_s,
-                          recovery_duration_s, total_response_time_s, drop_rate,
-                          recovery_rate, drop_area, recovery_area, skewness, kurt]])
+    # Distribution shape
+    skewness = float(pd.Series(y).skew(skipna=True))
+    kurt = float(pd.Series(y).kurtosis(skipna=True))
+
+    # Final feature vector (12 features)
+    features = np.array([[
+        baseline_mean, min_val, drop_magnitude, drop_duration_s,
+        recovery_duration_s, total_response_time_s, drop_rate,
+        recovery_rate, drop_area, recovery_area, skewness, kurt
+    ]], dtype=float)
+
     return features
 
-# ---------------- SERIAL READER ----------------
+
+
 def serial_reader():
     try:
         ser = serial.Serial(SERIAL_PORT, BAUDRATE, timeout=0.5)
@@ -95,59 +137,78 @@ def serial_reader():
             line = line_bytes.decode("utf-8", errors="ignore").strip()
             if not line:
                 continue
-            try:
-                parts = line.split(",")
-                if len(parts) < 10:
-                    continue
-                sensor_id = parts[0]
-                gas_resistance = float(parts[8])
-                temperature = float(parts[5])
-                pressure = float(parts[6])
-                humidity = float(parts[7])
-                status = parts[9]
-                index = int(parts[1])
-                gas_index = int(parts[3])
-                mes_index = int(parts[4])
-                millis = int(parts[2])
-            except Exception as e:
-                print("Parse error:", e)
+
+            # Initialize for this iteration
+            pred_label = None
+            raw_confidence = 0.0            
+
+            parts = line.split(",")
+            if len(parts) < 10:
                 continue
+            sensor_id = parts[0]
+            gas_resistance = float(parts[8])
+            temperature = float(parts[5])
+            pressure = float(parts[6])
+            humidity = float(parts[7])
+            status = parts[9]
+            gas_index = int(parts[3])
+            mes_index = int(parts[4])
+            index = int(parts[1])
+            millis = int(parts[2])
 
-            # Append to segment buffer
-            segment_buffer[sensor_id].append(gas_resistance)
-            if len(segment_buffer[sensor_id]) < SEGMENT_SIZE:
-                continue
-
-            # Extract features
-            gas_arr = np.array(segment_buffer[sensor_id])
-            features = extract_features_segment(gas_arr)
-
-            # Predict
-            pred_label = rf_model.predict(features)[0]
-            raw_confidence = float(np.max(rf_model.predict_proba(features)[0])) if hasattr(rf_model, "predict_proba") else 1.0
-
-            # Threshold logic
-            if last_raw_prediction[sensor_id] == pred_label:
-                prediction_streak[sensor_id] += 1
-            else:
-                prediction_streak[sensor_id] = 1
-                last_raw_prediction[sensor_id] = pred_label
-
-            if prediction_streak[sensor_id] >= THRESHOLD:
-                current_prediction[sensor_id] = pred_label
-                current_confidence[sensor_id] = raw_confidence
-                prediction_streak[sensor_id] = 0
-
-            # Store for plotting
+            # Append to serial buffer for plotting
             with serial_lock:
-                serial_buffer[sensor_id].append({
-                    "millis": millis,
-                    "gas_resistance": gas_resistance
-                })
+                serial_buffer[sensor_id].append({"millis": millis, "gas_resistance": gas_resistance})
                 predictions_buffer[sensor_id].append({
                     "millis": millis,
                     "prediction": current_prediction[sensor_id] if current_prediction[sensor_id] else "None"
                 })
+
+            # Initialize baseline
+            if baseline_value[sensor_id] is None:
+                baseline_value[sensor_id] = gas_resistance
+
+            # --- DROP DETECTION ---
+            if not collecting_segment[sensor_id]:
+                drop_percent = (baseline_value[sensor_id] - gas_resistance) / baseline_value[sensor_id] * 100
+                print(f"[{sensor_id}] Drop: {drop_percent:.2f}% (Threshold: {DROP_THRESHOLD_PERCENT*100:.0f}%)")
+
+                if drop_percent >= DROP_THRESHOLD_PERCENT * 100:
+                    collecting_segment[sensor_id] = True
+                    # pegar resistência imediatamente antes do drop
+                    drop_start_value[sensor_id] = serial_buffer[sensor_id][-2]["gas_resistance"] if len(serial_buffer[sensor_id]) >= 2 else gas_resistance
+                    segment_values[sensor_id] = [drop_start_value[sensor_id], gas_resistance]
+
+            else:
+                # Keep collecting the full drop/recovery segment
+                segment_values[sensor_id].append(gas_resistance)
+
+                # Only start prediction after PREDICTION_START_SEGMENTS points
+                if len(segment_values[sensor_id]) >= PREDICTION_START_SEGMENTS:
+                    features = extract_features_segment(segment_values[sensor_id])
+                    try:
+                        pred_label = rf_model.predict(features)[0]
+                        raw_confidence = float(np.max(rf_model.predict_proba(features)[0])) if hasattr(rf_model, "predict_proba") else 1.0
+                    except:
+                        pred_label = None
+                        raw_confidence = 0.0
+
+                    current_prediction[sensor_id] = pred_label
+                    current_confidence[sensor_id] = raw_confidence
+
+                # Continue for POST_BASELINE_POINTS after reaching baseline
+                if gas_resistance >= baseline_value[sensor_id]:
+                    post_baseline_counter[sensor_id] += 1
+                    if post_baseline_counter[sensor_id] >= POST_BASELINE_POINTS:
+                        # Reset everything after threshold points
+                        collecting_segment[sensor_id] = False
+                        segment_values[sensor_id] = []
+                        current_prediction[sensor_id] = None
+                        current_confidence[sensor_id] = None
+                        post_baseline_counter[sensor_id] = 0
+                else:
+                    # Still below baseline → reset counter
+                    post_baseline_counter[sensor_id] = 0
 
             # ---------------- LOG TO CSV ----------------
             row = {
@@ -162,14 +223,23 @@ def serial_reader():
                 "gas_resistance": gas_resistance,
                 "status": status
             }
+            csv_columns_full = list(row.keys())
             with open(csv_file, mode="a", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=csv_columns)
+                writer = csv.DictWriter(f, fieldnames=csv_columns_full)
                 writer.writerow(row)
+            if collecting_segment[sensor_id]:
+                display_label = "Analyzing..."
+            else:
+                display_label = "OK"
 
-            print(f"[{sensor_id}] RAW={pred_label} | CURRENT={current_prediction[sensor_id]} (conf={current_confidence[sensor_id]:.2f})")
+            # ---------------- PRINT OUTPUT ----------------
+            print(f"[{sensor_id}] RAW={pred_label} | CURRENT={current_prediction[sensor_id]} "
+                  f"(conf={current_confidence[sensor_id] if current_confidence[sensor_id] else 0:.2f})")
 
         except Exception as e:
             print("[serial_reader] Error:", e)
+
+
 
 # ---------------- DASH APP ----------------
 app = Dash(__name__)
@@ -202,35 +272,98 @@ def update_dashboard(n):
         "ar": "#10b981",
         "cigarro": "#ef4444",
         "alcool": "#3b82f6",
+        "OK" : "#0c480c",
         None: "#9ca3af"
     }
 
     cards = []
     for sid in sensor_ids:
+        # Use latest prediction if available
         pred_label = current_prediction[sid]
-        pred_conf = current_confidence[sid]
-        pred_text = f"{pred_label} ({pred_conf:.2f})" if pred_label else "None"
-        bg_color = color_map.get(pred_label, "#9ca3af")
+        pred_conf = current_confidence[sid] if current_confidence[sid] else 0.0
+
+        if collecting_segment[sid]:
+            if pred_label is not None:
+                display_text = f"{pred_label} ({pred_conf:.2f})"
+                bg_color = color_map.get(pred_label, "#fbbf24")
+            else:
+                display_text = "Analyzing..."
+                bg_color = "#fbbf24"  # fallback
+        else:
+            if pred_label is None:
+                display_text = "OK"
+                bg_color = color_map.get("OK", "#0c480c")
+            else:
+                display_text = f"{pred_label} ({pred_conf:.2f})"
+                bg_color = color_map.get(pred_label, "#9ca3af")
 
         cards.append(html.Div([
             html.H4(f"Sensor {sid}", style={"color":"white"}),
-            html.Div(pred_text,
+            html.Div(display_text,
                     style={"backgroundColor": bg_color,"color":"white","padding":"6px",
-                           "borderRadius":"6px","textAlign":"center","fontSize":"16px"})
+                            "borderRadius":"6px","textAlign":"center","fontSize":"16px"})
         ], style={"backgroundColor":"#222","padding":"10px","borderRadius":"8px"}))
+
+
 
     rows = int(np.ceil(len(sensor_ids)/2))
     cols = 2 if len(sensor_ids) > 1 else 1
     fig = make_subplots(rows=rows, cols=cols, subplot_titles=[f"Sensor {sid}" for sid in sensor_ids])
     for idx, sid in enumerate(sensor_ids):
         df = dfs[sid]
-        if df.empty: continue
+        if df.empty:
+            continue
+
+        # add timestamp for plotting
         df["timestamp"] = start_time + pd.to_timedelta(df["millis"], unit="ms")
-        row = idx//cols + 1
-        col = idx%cols + 1
+
+        row = idx // cols + 1
+        col = idx % cols + 1
+
+        # --- main line trace ---
         fig.add_trace(go.Scatter(
-            x=df["timestamp"], y=df["gas_resistance"], mode="lines", name=f"Gas {sid}", line=dict(color="#00FFFF")
+            x=df["timestamp"], y=df["gas_resistance"],
+            mode="lines", name=f"Gas {sid}",
+            line=dict(color="#00FFFF")
         ), row=row, col=col)
+
+        # --- highlight drop segment ---
+        if segment_values.get(sid):
+            seg_y = segment_values[sid]
+            seg_x = df["timestamp"].iloc[-len(seg_y):]  # pegar os timestamps correspondentes
+            seg_color = color_map.get(current_prediction[sid], "#fbbf24")
+            fig.add_trace(go.Scatter(
+                x=seg_x,
+                y=seg_y,
+                mode="markers+lines",
+                name=f"Segment {sid}",
+                line=dict(color=seg_color, dash="dot"),
+                marker=dict(size=6, color=seg_color, symbol="circle"),
+                showlegend=True
+            ), row=row, col=col)
+        # # --- highlight last prediction segment ---
+        # if len(df) >= SEGMENT_SIZE:
+        #     segment_df = df.iloc[-SEGMENT_SIZE:]
+        #     seg_color = color_map.get(current_prediction[sid], "#fbbf24")  # orange fallback
+        #     fig.add_trace(go.Scatter(
+        #         x=segment_df["timestamp"], y=segment_df["gas_resistance"],
+        #         mode="markers+lines",
+        #         name=f"Segment {sid}",
+        #         line=dict(color=seg_color, dash="dot"),
+        #         marker=dict(size=6, color=seg_color, symbol="circle"),
+        #         showlegend=True
+        #     ), row=row, col=col)
+
+    # for idx, sid in enumerate(sensor_ids):
+    #     df = dfs[sid]
+    #     if df.empty:
+    #         continue
+    #     df["timestamp"] = start_time + pd.to_timedelta(df["millis"], unit="ms")
+    #     row = idx//cols + 1
+    #     col = idx%cols + 1
+    #     fig.add_trace(go.Scatter(
+    #         x=df["timestamp"], y=df["gas_resistance"], mode="lines", name=f"Gas {sid}", line=dict(color="#00FFFF")
+    #     ), row=row, col=col)
 
     fig.update_layout(template="plotly_dark", hovermode="x unified", height=800)
     fig.update_yaxes(title_text="Gas Resistance (Ω, log)", type="log")
