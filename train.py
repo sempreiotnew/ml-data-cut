@@ -12,21 +12,12 @@ df = pd.read_csv("data.csv")
 # ----------------------------
 # Features and target
 # ----------------------------
-feature_cols = [
-    "baseline_mean",
-    "min_val",
-    "drop_magnitude",
-    "drop_duration_s",
-    "recovery_duration_s",
-    "total_response_time_s",
-    "drop_rate",
-    "recovery_rate",
-    "drop_area",
-    "recovery_area",
-    "skewness",
-    "kurtosis"
-]
+feature_cols = df.columns.tolist()
+print(feature_cols)
 
+
+# Get all columns except the target
+feature_cols = [col for col in df.columns if col != "label"]
 X = df[feature_cols].values
 y = df["label"].values  # target classes: alcool, cigarro, ar
 
