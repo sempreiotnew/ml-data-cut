@@ -4,7 +4,7 @@ from dash import Dash, dcc, html, Input, State, Output, no_update
 import plotly.graph_objs as go
 import io, base64
 import os
-from features import compute_fingerprint, extract_features
+from features import extract_features
 from helper import build_table, build_layout
 
 app = Dash(__name__)
@@ -43,6 +43,7 @@ def update_dropdown(contents, filename):
     if contents is None:
         return [], None, ""
     df_global = parse_contents(contents, filename)
+    print(df_global)
     if df_global is None:
         return [], None, "Failed to load file."
     if 'id' not in df_global.columns:
@@ -243,20 +244,20 @@ def update_metrics(selected_id, stored_selected):
         return "Selected points do not match any data."
 
 
-    features_arr, feature_names, fingerprint = extract_features(
+    features_arr, feature_names = extract_features(
+            sensor_id=selected_id,
             gas_arr=df_selected['gas_resistance'].values,
             temp_arr=df_selected['temperature'].values,
             pressure_arr=df_selected['pressure'].values,
             humidity_arr=df_selected['humidity'].values,
-            millis_arr=df_selected['millis'].values,   # pass ms -> extract_features computes t from this
-            rel_threshold=0.05
-        )
+            millis_arr=df_selected['millis'].values
+    )
         # Also show extracted features vector (pair names + values)
     feature_items = []
     for name, val in zip(feature_names, features_arr.flatten()):
         # some features may be NaN (should be turned into 0.0 by your extract_features), but format safely:
         try:
-            feature_items.append(html.Li(f"{name}: {val:.6f}"))
+            feature_items.append(html.Li(f"{name}: {val:.2f}"))
         except Exception:
             feature_items.append(html.Li(f"{name}: {val}"))
 
@@ -315,14 +316,13 @@ def export_metrics(n_clicks, stored_selected, dropdown_options, curve_label):
         else:
             continue
 
-        # fingerprint = compute_fingerprint(t, y, rel_threshold=0.05)
-        features_arr, feature_names, fingerprint = extract_features(
+        features_arr, feature_names = extract_features(
+            sensor_id=sensor_id,
             gas_arr=df_selected['gas_resistance'].values,
             temp_arr=df_selected['temperature'].values,
             pressure_arr=df_selected['pressure'].values,
             humidity_arr=df_selected['humidity'].values,
             millis_arr=df_selected['millis'].values,   # pass ms -> extract_features computes t from this
-            rel_threshold=0.05,
         )
         
 
@@ -330,10 +330,10 @@ def export_metrics(n_clicks, stored_selected, dropdown_options, curve_label):
             return "No data to export."
 
         # Add label column
-        feature_names_with_label = ['sensor_id'] + feature_names + ['label']
+        feature_names_with_label = feature_names + ['label']
         
         features_arr_with_label = np.array(
-            [sensor_id] + features_arr.tolist() + [curve_label],
+            features_arr.tolist() + [curve_label],
             dtype=object
         )
         print(features_arr_with_label)
@@ -347,6 +347,7 @@ def export_metrics(n_clicks, stored_selected, dropdown_options, curve_label):
             df_export.to_csv("data.csv", mode='w', header=True, index=False)
 
     return f"Exported {len(rows_to_export)} sensors to 'data.csv'."
+
 
 if __name__ == '__main__':
     app.run(debug=True, port=8051)

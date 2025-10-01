@@ -13,15 +13,16 @@ from scipy.stats import skew, kurtosis
 import csv
 import numpy as np
 import pandas as pd
+from features import extract_features
 
 # ---------------- CONFIG ----------------
 SERIAL_PORT = "/dev/cu.usbserial-0289722F"
 BAUDRATE = 115200
 MAX_BUFFER_LINES = 5000
 SEGMENT_SIZE = 20
-THRESHOLD = 50
-CONFIDENCE_THRESHOLD = 0.6   # how much confidence to show the current prediction
-DROP_THRESHOLD_PERCENT = 0.1 # how much the baseline drops to start analyze
+THRESHOLD = 20
+CONFIDENCE_THRESHOLD = 0.51   # how much confidence to show the current prediction
+DROP_THRESHOLD_PERCENT = 0.2 # how much the baseline drops to start analyze
 POST_BASELINE_POINTS = 100  # number of points to continue prediction after baseline
 PREDICTION_START_SEGMENTS = 50 # How many points to wait before starting prediction
 
@@ -33,9 +34,14 @@ serial_buffer = defaultdict(lambda: deque(maxlen=MAX_BUFFER_LINES))
 segment_buffer = defaultdict(lambda: deque(maxlen=SEGMENT_SIZE))
 predictions_buffer = defaultdict(lambda: deque(maxlen=MAX_BUFFER_LINES))
 current_prediction = defaultdict(lambda: None)
+recent_predictions = defaultdict(list)
 current_confidence = defaultdict(lambda: None)
 collecting_segment = defaultdict(lambda: False)
 segment_values = defaultdict(list)
+segment_values_h = defaultdict(list)
+segment_values_t = defaultdict(list)
+segment_values_p = defaultdict(list)
+segment_values_m = defaultdict(list)
 baseline_value = defaultdict(lambda: None)
 drop_start_value = defaultdict(lambda: None)
 last_raw_prediction = defaultdict(lambda: None)
@@ -57,125 +63,6 @@ with open(csv_file, mode="w", newline="") as f:
     writer = csv.DictWriter(f, fieldnames=csv_columns)
     writer.writeheader()
 
-
-
-def extract_features_segment(gas_arr, sensor_id, temperature_arr=None, pressure_arr=None, humidity_arr=None):
-    """
-    Extracts features for the full model matching your dataset.
-
-    Args:
-        gas_arr: list or np.array of gas resistance readings
-        temperature_arr: list or np.array of temperature readings (optional)
-        pressure_arr: list or np.array of pressure readings (optional)
-        humidity_arr: list or np.array of humidity readings (optional)
-    Returns:
-        np.array of shape (1, 43) matching your CSV columns (excluding label)
-    """
-    y = np.array(gas_arr, dtype=float)
-    t = np.arange(len(y), dtype=float)
-
-    if len(y) == 0:
-        # Return zeros if no data
-        return np.zeros((1, 43))
-
-    # Basic gas features
-    n_points = len(y)
-    baseline_mean = float(np.mean(y[:min(5, len(y))]))
-    baseline_median = float(np.median(y[:min(5, len(y))]))
-    baseline_std = float(np.std(y[:min(5, len(y))], ddof=1))
-
-    min_idx = int(np.argmin(y))
-    min_val = float(y[min_idx])
-    drop_magnitude = baseline_mean - min_val
-    drop_start_idx = 0
-    drop_start_time_s = 0.0  # if you have sampling rate, adjust
-    drop_duration_s = float(max(0.0, t[min_idx] - t[drop_start_idx]))
-    recovery_end_idx = len(y) - 1
-    recovery_duration_s = float(max(0.0, t[recovery_end_idx] - t[min_idx]))
-    total_response_time_s = float(max(0.0, t[recovery_end_idx] - t[drop_start_idx]))
-    drop_rate = drop_magnitude / drop_duration_s if drop_duration_s > 0 else 0.0
-    recovery_rate = (y[recovery_end_idx] - min_val) / recovery_duration_s if recovery_duration_s > 0 else 0.0
-
-    # Slopes
-    dy = np.diff(y)
-    dt = np.diff(t)
-    slopes = dy / dt
-    max_negative_slope = float(np.min(slopes)) if len(slopes) > 0 else 0.0
-    max_positive_slope = float(np.max(slopes)) if len(slopes) > 0 else 0.0
-    mean_slope = float(np.mean(slopes)) if len(slopes) > 0 else 0.0
-
-    # Areas
-    drop_area = float(np.trapezoid(baseline_mean - y[drop_start_idx:min_idx+1], x=t[drop_start_idx:min_idx+1])) if min_idx > 0 else 0.0
-    recovery_area = float(np.trapezoid(y[min_idx:recovery_end_idx+1] - min_val, x=t[min_idx:recovery_end_idx+1])) if recovery_end_idx > min_idx else 0.0
-    area_symmetry = drop_area / recovery_area if recovery_area != 0 else 0.0
-
-    # Distribution
-    skewness = float(pd.Series(y).skew(skipna=True))
-    kurt_val = float(pd.Series(y).kurtosis(skipna=True))
-
-    # Peaks / inflection points
-    from scipy.signal import find_peaks
-
-    peaks, _ = find_peaks(y)
-    troughs, _ = find_peaks(-y)
-    inflection_points = len(peaks) + len(troughs)
-    peaks_before_min = len(peaks[peaks < min_idx])
-    peaks_after_min = len(peaks[peaks > min_idx])
-
-    recovery_percentage = (y[recovery_end_idx] - min_val) / drop_magnitude if drop_magnitude != 0 else 0.0
-    final_value = float(y[recovery_end_idx])
-    time_to_min_fraction = t[min_idx] / t[-1] if t[-1] != 0 else 0.0
-
-    # Gas statistics
-    gas_mean = float(np.mean(y))
-    gas_min = float(np.min(y))
-    gas_max = float(np.max(y))
-    gas_std = float(np.std(y, ddof=1))
-
-    # Temperature
-    if temperature_arr is not None:
-        temp = np.array(temperature_arr, dtype=float)
-        temperature_mean = float(np.mean(temp))
-        temperature_min = float(np.min(temp))
-        temperature_max = float(np.max(temp))
-        temperature_std = float(np.std(temp, ddof=1))
-    else:
-        temperature_mean = temperature_min = temperature_max = temperature_std = 0.0
-
-    # Pressure
-    if pressure_arr is not None:
-        pres = np.array(pressure_arr, dtype=float)
-        pressure_mean = float(np.mean(pres))
-        pressure_min = float(np.min(pres))
-        pressure_max = float(np.max(pres))
-        pressure_std = float(np.std(pres, ddof=1))
-    else:
-        pressure_mean = pressure_min = pressure_max = pressure_std = 0.0
-
-    # Humidity
-    if humidity_arr is not None:
-        hum = np.array(humidity_arr, dtype=float)
-        humidity_mean = float(np.mean(hum))
-        humidity_min = float(np.min(hum))
-        humidity_max = float(np.max(hum))
-        humidity_std = float(np.std(hum, ddof=1))
-    else:
-        humidity_mean = humidity_min = humidity_max = humidity_std = 0.0
-
-    # Final feature vector (43 features)
-    features = np.array([[
-        sensor_id,
-        n_points, baseline_mean, baseline_median, baseline_std, min_val, min_idx, drop_magnitude,
-        drop_start_idx, drop_start_time_s, drop_duration_s, recovery_end_idx, recovery_duration_s,
-        total_response_time_s, drop_rate, recovery_rate, max_negative_slope, max_positive_slope,
-        mean_slope, drop_area, recovery_area, area_symmetry, skewness, kurt_val,
-        inflection_points, peaks_before_min, peaks_after_min, recovery_percentage, final_value,
-        time_to_min_fraction, gas_mean, gas_min, gas_max, gas_std, temperature_mean, temperature_min,
-        temperature_max, temperature_std, pressure_mean, pressure_min, pressure_max, pressure_std,
-        humidity_mean, humidity_min, humidity_max, humidity_std
-    ]], dtype=float)
-
-    return features
 
 def serial_reader():
     try:
@@ -233,24 +120,54 @@ def serial_reader():
                     # pegar resistência imediatamente antes do drop
                     drop_start_value[sensor_id] = serial_buffer[sensor_id][-2]["gas_resistance"] if len(serial_buffer[sensor_id]) >= 2 else gas_resistance
                     segment_values[sensor_id] = [drop_start_value[sensor_id], gas_resistance]
+                    segment_values_t[sensor_id] = [drop_start_value[sensor_id], temperature]
+                    segment_values_h[sensor_id] = [drop_start_value[sensor_id], humidity]
+                    segment_values_p[sensor_id] = [drop_start_value[sensor_id], pressure]
+                    segment_values_m[sensor_id] = [drop_start_value[sensor_id], millis]
 
             else:
                 # Keep collecting the full drop/recovery segment
                 segment_values[sensor_id].append(gas_resistance)
+                segment_values_t[sensor_id].append(temperature)
+                segment_values_h[sensor_id].append(humidity)
+                segment_values_p[sensor_id].append(pressure)
+                segment_values_m[sensor_id].append(millis)
 
                 # Only start prediction after PREDICTION_START_SEGMENTS points
                 if len(segment_values[sensor_id]) >= PREDICTION_START_SEGMENTS:
-                    features = extract_features_segment(segment_values[sensor_id], sensor_id,)
+                    # features = extract_features_segment(segment_values[sensor_id], sensor_id,)
+                    features, _ = extract_features(
+                        sensor_id,
+                        gas_arr=segment_values[sensor_id],
+                        temp_arr=segment_values_t[sensor_id],
+                        humidity_arr=segment_values_h[sensor_id],
+                        pressure_arr=segment_values_p[sensor_id],
+                        millis_arr=segment_values_m[sensor_id]
+                    )
+                    features = features.reshape(1, -1)
                     try:
                         pred_label = rf_model.predict(features)[0]
                         raw_confidence = float(np.max(rf_model.predict_proba(features)[0])) if hasattr(rf_model, "predict_proba") else 1.0
-                    except:
+                    except Exception as e:
                         pred_label = None
                         raw_confidence = 0.0
+                        print(e)
 
-                    current_prediction[sensor_id] = pred_label
-                    current_confidence[sensor_id] = raw_confidence
+                    # current_prediction[sensor_id] = pred_label
+                    # current_confidence[sensor_id] = raw_confidence
 
+                # --- THRESHOLD & CONFIDENCE LOGIC ---
+                    if raw_confidence >= CONFIDENCE_THRESHOLD and pred_label is not None:
+                        recent_predictions[sensor_id].append(pred_label)
+                        if len(recent_predictions[sensor_id]) > THRESHOLD:
+                            recent_predictions[sensor_id].pop(0)
+
+                        # Only update current_prediction if last THRESHOLD predictions are identical
+                        if len(recent_predictions[sensor_id]) == THRESHOLD and len(set(recent_predictions[sensor_id])) == 1:
+                            current_prediction[sensor_id] = pred_label
+                            current_confidence[sensor_id] = raw_confidence
+                    else:
+                        pred_label = None  # Ignore low-confidence predictions   
                 # Continue for POST_BASELINE_POINTS after reaching baseline
                 if gas_resistance >= baseline_value[sensor_id]:
                     post_baseline_counter[sensor_id] += 1
@@ -258,7 +175,11 @@ def serial_reader():
                         # Reset everything after threshold points
                         collecting_segment[sensor_id] = False
                         segment_values[sensor_id] = []
-                        current_prediction[sensor_id] = None
+                        current_prediction[sensor_id] = None 
+                        segment_values_t[sensor_id] = None
+                        segment_values_h[sensor_id] = None
+                        segment_values_p[sensor_id] = None
+                        segment_values_m[sensor_id] = None
                         current_confidence[sensor_id] = None
                         post_baseline_counter[sensor_id] = 0
                 else:
@@ -289,7 +210,8 @@ def serial_reader():
 
             # ---------------- PRINT OUTPUT ----------------
             print(f"[{sensor_id}] RAW={pred_label} | CURRENT={current_prediction[sensor_id]} "
-                  f"(conf={current_confidence[sensor_id] if current_confidence[sensor_id] else 0:.2f})")
+                  f"(conf={current_confidence[sensor_id] if current_confidence[sensor_id] else 0:.2f})"
+                  f"Threshold {len(recent_predictions[sensor_id])} - {THRESHOLD}")
 
         except Exception as e:
             print("[serial_reader] Error:", e)
