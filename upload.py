@@ -290,6 +290,7 @@ def export_metrics(n_clicks, stored_selected, dropdown_options, curve_label):
 
     # For each sensor, build df_selected using the stored selection (same behaviour as UI)
     for sensor_opt in dropdown_options:
+        print(dropdown_options)
         sensor_id = sensor_opt['value']
         df_filtered = df_global[df_global['id'] == sensor_id].copy()
         df_filtered['millis'] = pd.to_numeric(df_filtered.get('millis'), errors='coerce')
@@ -314,10 +315,6 @@ def export_metrics(n_clicks, stored_selected, dropdown_options, curve_label):
         else:
             continue
 
-        y = df_selected['gas_resistance'].values.astype(float)
-        t = df_selected['time'].values.astype(float)
-        millis = df_selected['millis'].values.astype(int)
-
         # fingerprint = compute_fingerprint(t, y, rel_threshold=0.05)
         features_arr, feature_names, fingerprint = extract_features(
             gas_arr=df_selected['gas_resistance'].values,
@@ -325,24 +322,29 @@ def export_metrics(n_clicks, stored_selected, dropdown_options, curve_label):
             pressure_arr=df_selected['pressure'].values,
             humidity_arr=df_selected['humidity'].values,
             millis_arr=df_selected['millis'].values,   # pass ms -> extract_features computes t from this
-            rel_threshold=0.05
+            rel_threshold=0.05,
         )
         
 
-    if not features_arr.any():
-        return "No data to export."
+        if not features_arr.any():
+            return "No data to export."
 
-    # Add label column
-    feature_names_with_label = feature_names + ['label']
-    features_arr_with_label = np.append(features_arr, curve_label)
-    
-    df_export = pd.DataFrame([features_arr_with_label], columns=feature_names_with_label)
+        # Add label column
+        feature_names_with_label = ['sensor_id'] + feature_names + ['label']
+        
+        features_arr_with_label = np.array(
+            [sensor_id] + features_arr.tolist() + [curve_label],
+            dtype=object
+        )
+        print(features_arr_with_label)
+        
+        df_export = pd.DataFrame([features_arr_with_label], columns=feature_names_with_label)
 
-    file_exists = os.path.isfile("data.csv")
-    if file_exists:
-        df_export.to_csv("data.csv", mode='a', header=False, index=False)
-    else:
-        df_export.to_csv("data.csv", mode='w', header=True, index=False)
+        file_exists = os.path.isfile("data.csv")
+        if file_exists:
+            df_export.to_csv("data.csv", mode='a', header=False, index=False)
+        else:
+            df_export.to_csv("data.csv", mode='w', header=True, index=False)
 
     return f"Exported {len(rows_to_export)} sensors to 'data.csv'."
 

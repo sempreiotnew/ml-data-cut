@@ -20,12 +20,10 @@ BAUDRATE = 115200
 MAX_BUFFER_LINES = 5000
 SEGMENT_SIZE = 20
 THRESHOLD = 50
-CONFIDENCE_THRESHOLD = 0.01  
-DROP_THRESHOLD_PERCENT = 0.01
-
+CONFIDENCE_THRESHOLD = 0.6   # how much confidence to show the current prediction
+DROP_THRESHOLD_PERCENT = 0.1 # how much the baseline drops to start analyze
 POST_BASELINE_POINTS = 100  # number of points to continue prediction after baseline
-# How many points to wait before starting prediction
-PREDICTION_START_SEGMENTS = 20
+PREDICTION_START_SEGMENTS = 50 # How many points to wait before starting prediction
 
 serial_lock = threading.Lock()
 
@@ -61,7 +59,7 @@ with open(csv_file, mode="w", newline="") as f:
 
 
 
-def extract_features_segment(gas_arr, temperature_arr=None, pressure_arr=None, humidity_arr=None):
+def extract_features_segment(gas_arr, sensor_id, temperature_arr=None, pressure_arr=None, humidity_arr=None):
     """
     Extracts features for the full model matching your dataset.
 
@@ -166,6 +164,7 @@ def extract_features_segment(gas_arr, temperature_arr=None, pressure_arr=None, h
 
     # Final feature vector (43 features)
     features = np.array([[
+        sensor_id,
         n_points, baseline_mean, baseline_median, baseline_std, min_val, min_idx, drop_magnitude,
         drop_start_idx, drop_start_time_s, drop_duration_s, recovery_end_idx, recovery_duration_s,
         total_response_time_s, drop_rate, recovery_rate, max_negative_slope, max_positive_slope,
@@ -241,7 +240,7 @@ def serial_reader():
 
                 # Only start prediction after PREDICTION_START_SEGMENTS points
                 if len(segment_values[sensor_id]) >= PREDICTION_START_SEGMENTS:
-                    features = extract_features_segment(segment_values[sensor_id])
+                    features = extract_features_segment(segment_values[sensor_id], sensor_id,)
                     try:
                         pred_label = rf_model.predict(features)[0]
                         raw_confidence = float(np.max(rf_model.predict_proba(features)[0])) if hasattr(rf_model, "predict_proba") else 1.0
