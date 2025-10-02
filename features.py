@@ -2,6 +2,8 @@
 import numpy as np
 import pandas as pd
 from typing import Any, Tuple, List
+from scipy.signal import find_peaks
+import matplotlib.pyplot as plt
 
 def safe_to_float_array(x: Any) -> np.ndarray:
     if x is None:
@@ -26,199 +28,96 @@ def safe_to_float_array(x: Any) -> np.ndarray:
         return np.array([np.nan], dtype=float)
 
 
-def _count_runs(mask: np.ndarray) -> int:
-    """Count contiguous True runs in boolean mask."""
-    if mask.size == 0:
-        return 0
-    m = mask.astype(int)
-    starts = np.where((m == 1) & (np.concatenate(([0], m[:-1])) == 0))[0]
-    return int(len(starts))
-
-
-def _count_recovery_peaks(gas: np.ndarray, baseline: float, threshold: float) -> int:
-    """
-    Count peaks up as recoveries after drops below (baseline - threshold)
-    until gas rises back above that level.
-    """
-    total = 0
-    in_drop = False
-    for val in gas:
-        if np.isnan(val):
-            continue
-        if val <= baseline - threshold:
-            in_drop = True
-        elif in_drop and val > baseline - threshold:
-            total += 1
-            in_drop = False
-    return total
-
-def _compute_drop_time(gas, baseline, threshold_abs, millis):
-    # -----------------------
-    # Compute total drop time
-    # -----------------------
-    drop_total_time_s = 0
-    recovery_total_time_s = 0
-
-    in_drop = False
-    drop_start = 0
-    recovery_start = 0
-    for i, val in enumerate(gas):
-        if np.isnan(val):
-            continue
-        if val <= baseline - threshold_abs:
-            if not in_drop:
-                drop_start = millis[i]
-                in_drop = True
-        else:
-            if in_drop:
-                drop_end = millis[i]
-                drop_total_time_s += (drop_end - drop_start) / 1000.0
-                recovery_start = drop_end
-                in_drop = False
-                # Recovery duration until gas rises above baseline - threshold
-                j = i
-                while j < len(gas) and gas[j] <= baseline - threshold_abs:
-                    j += 1
-                if j < len(gas):
-                    recovery_end = millis[j]
-                    recovery_total_time_s += (recovery_end - recovery_start) / 1000.0    
-
-
-def _compute_peaks(gas, millis, threshold_pct):
-    total_peaks_down = 0
-    total_peaks_up = 0
-
-    if gas.size >= 1 and not np.all(np.isnan(gas)) and millis.size == gas.size:
-            baseline = gas[0] if not np.isnan(gas[0]) else np.nan
-            if np.isnan(baseline) or baseline == 0:
-                valid_prefix = gas[~np.isnan(gas)]
-                baseline = float(np.nanmean(valid_prefix[:min(5, valid_prefix.size)])) if valid_prefix.size > 0 else np.nan
-
-            if not np.isnan(baseline):
-                threshold_abs = abs(baseline) * threshold_pct
-                valid = ~np.isnan(gas)
-                drop_mask = (gas <= baseline - threshold_abs) & valid
-                total_peaks_down = _count_runs(drop_mask)
-                total_peaks_up = _count_recovery_peaks(gas, baseline, threshold_abs)
-
-                
-    return total_peaks_down, total_peaks_up
-
-
-# # -------------------------------
-# # Drop Area
-# # -------------------------------
-# def compute_drop_area(gas_arr: Any, millis_arr: Any, baseline: float = None) -> float:
-#     gas = safe_to_float_array(gas_arr)
-#     millis = safe_to_float_array(millis_arr) / 1000.0  # convert to seconds
-#     if gas.size == 0 or millis.size == 0:
-#         return np.nan
-#     baseline = baseline if baseline is not None else gas[0]
-#     min_idx = np.nanargmin(gas)
-#     drop_area = np.trapezoid(baseline - gas[:len(gas)], x=millis[:len(millis)])
-#     return float(drop_area)
-
-
-# # -------------------------------
-# # Recovery Area
-# # -------------------------------
-# def compute_recovery_area(gas_arr: Any, millis_arr: Any) -> float:
-#     gas = safe_to_float_array(gas_arr)
-#     millis = safe_to_float_array(millis_arr) / 1000.0  # seconds
-#     if gas.size == 0 or millis.size == 0:
-#         return np.nan
-#     min_idx = np.nanargmin(gas)
-#     recovery_area = np.trapezoid(y=gas[0:], x=millis[0:])
-#     return float(recovery_area)
-
-
-# # -------------------------------
-# # Slope Drop
-# # -------------------------------
-# def compute_slope_drop(gas_arr: Any, millis_arr: Any) -> float:
-#     gas = safe_to_float_array(gas_arr)
-#     millis = safe_to_float_array(millis_arr) / 1000.0  # seconds
-#     if gas.size < 2 or millis.size < 2:
-#         return np.nan
-#     # segment from start to min value
-#     min_idx = np.nanargmin(gas)
-#     slope_drop = (gas[min_idx] - gas[0]) / (millis[min_idx] - millis[0])
-#     return float(slope_drop)
-
-
-# # -------------------------------
-# # Slope Recovery
-# # -------------------------------
-# def compute_slope_recovery(gas_arr: Any, millis_arr: Any) -> float:
-#     gas = safe_to_float_array(gas_arr)
-#     millis = safe_to_float_array(millis_arr) / 1000.0  # seconds
-#     if gas.size < 2 or millis.size < 2:
-#         return np.nan
-#     # segment from min value to end
-#     min_idx = np.nanargmin(gas)
-#     slope_recovery = (gas[-1] - gas[min_idx]) / (millis[-1] - millis[min_idx])
-#     return float(slope_recovery)
-
-import numpy as np
-from typing import Any
-
 def safe_to_float_array(arr: Any) -> np.ndarray:
     return np.array(arr, dtype=float)
 
-import numpy as np
-from typing import Any
-
-def safe_to_float_array(arr: Any) -> np.ndarray:
-    return np.array(arr, dtype=np.float64)
-
-# -------------------------------
-# Slope Drop
-# -------------------------------
-def compute_slope_drop(gas_arr: Any, millis_arr: Any) -> float:
-    gas = safe_to_float_array(gas_arr)
-    millis = safe_to_float_array(millis_arr) / 1000.0  # convert to seconds
-    if gas.size < 2 or millis.size < 2:
-        return 0.0
-
-    max_idx = np.nanargmax(gas)
-    # Find the first minimum **after** this max
-    if max_idx >= gas.size - 1:
-        return 0.0  # no drop possible
-    min_idx = gas[max_idx:].argmin() + max_idx
-
-    delta_gas = gas[max_idx] - gas[min_idx]
-    delta_time = millis[min_idx] - millis[max_idx]
-
-    # Only positive drop
-    if delta_gas <= 0 or delta_time <= 0:
-        return 0.0
-
-    return float(delta_gas / delta_time)
+def compute_standard_deviation(gas_arr : np.ndarray):
+    gas = np.asarray(gas_arr, dtype=float)
+    n = gas.size
+    
+    if n < 2:
+        return np.array([], dtype=float)
+    
+    stds = np.empty(n - 1, dtype=float)
+    
+    for i in range(1, n):
+        stds[i-1] = np.nanstd([gas[i-1], gas[i]])
+    
+    return stds
 
 
-# -------------------------------
-# Slope Recovery
-# -------------------------------
-def compute_slope_recovery(gas_arr: Any, millis_arr: Any) -> float:
-    gas = safe_to_float_array(gas_arr)
-    millis = safe_to_float_array(millis_arr) / 1000.0
-    if gas.size < 2 or millis.size < 2:
-        return 0.0
 
-    min_idx = np.nanargmin(gas)
-    # Recovery is max **after** min
-    if min_idx >= gas.size - 1:
-        return 0.0  # no recovery
-    max_after_min_idx = gas[min_idx:].argmax() + min_idx
 
-    delta_gas = gas[max_after_min_idx] - gas[min_idx]
-    delta_time = millis[max_after_min_idx] - millis[min_idx]
 
-    # Only positive recovery
-    if delta_gas <= 0 or delta_time <= 0:
-        return 0.0
+def calculate_area_fixed_segments(gas_arr: np.ndarray, segment_size: int = 50, fixed_baseline: float = 1e5):
+    plt.figure(figsize=(12,6))
+    plt.plot(gas_arr, label="Gas Sensor", color="gray")
 
-    return float(delta_gas / delta_time)
+    drop_areas = []
+
+    # Split the signal into fixed segments
+    for start in range(0, len(gas_arr), segment_size):
+        end = min(start + segment_size, len(gas_arr))
+        x_region = np.arange(start, end)
+        y_region = gas_arr[start:end]
+
+        # Area = curve down to fixed baseline
+        drop_values = y_region - fixed_baseline
+        total_area = np.trapezoid(drop_values)  # integrate
+        drop_areas.append(total_area)
+
+        # Fill area under curve to baseline
+        plt.fill_between(x_region, fixed_baseline, y_region, color="orange", alpha=0.3)
+
+        # Annotate area
+        mid_x = x_region[len(x_region)//2]
+        mid_y = fixed_baseline + np.max(drop_values)/2
+        plt.text(mid_x, mid_y, f"{total_area:.0f}", ha='center', va='bottom', fontsize=8, color='black')
+
+    plt.axhline(fixed_baseline, color="green", linestyle="--", label=f"Baseline ({fixed_baseline})")
+    plt.xlabel("Sample Index")
+    plt.ylabel("Gas Resistance")
+    plt.title(f"Gas Sensor Signal with Drop Areas ({segment_size}-measurement segments)")
+    plt.legend()
+    plt.show()
+
+    return drop_areas
+
+def find_peaks_segment(gas_arr: np.ndarray, fixed_baseline: float = 1e5):
+    data_min = np.min(gas_arr)
+    data_max = np.max(gas_arr)
+    rangePeak = 0.1 * (data_max - data_min)
+    rangeValley = 0.02 * (data_max - data_min)
+
+    # Find peaks
+    peaks, _ = find_peaks(
+        gas_arr,
+        height=data_min + rangePeak,
+        prominence=rangePeak,
+        distance=5
+    )
+
+    # Find valleys
+    valleys, _ = find_peaks(
+        -gas_arr,
+        prominence=rangeValley,
+        distance=5
+    )
+
+    plt.figure(figsize=(12,6))
+    plt.plot(gas_arr, label="Gas Sensor", color="gray")
+
+    plt.plot(peaks, gas_arr[peaks], "x", color="blue", label="Peaks")
+    plt.plot(valleys, gas_arr[valleys], "x", color="red", label="Valleys")
+    plt.axhline(fixed_baseline, color="green", linestyle="--", label=f"Baseline ({fixed_baseline})")
+    plt.xlabel("Sample Index")
+    plt.ylabel("Gas Resistance")
+    plt.title("Gas Sensor Signal with Drop Areas (Fixed Baseline)")
+    plt.legend()
+    plt.show()
+
+    return peaks, valleys
+
 
 def extract_features(
     sensor_id,    
@@ -235,6 +134,7 @@ def extract_features(
     press = safe_to_float_array(pressure_arr)
     hum = safe_to_float_array(humidity_arr)
     millis = safe_to_float_array(millis_arr)  # in milliseconds
+    
 
     def _stats(a: np.ndarray):
         if a.size == 0 or np.all(np.isnan(a)):
@@ -243,41 +143,85 @@ def extract_features(
             float(np.nanmin(a)),
             float(np.nanmax(a)),
             float(np.nanmean(a)),
-            float(np.nanstd(a, ddof=0)),
+            # float(np.nanstd(a, ddof=0)),
         )
 
-    gas_min, gas_max, gas_mean, gas_std = _stats(gas)
-    t_min, t_max, t_mean, t_std = _stats(temp)
-    p_min, p_max, p_mean, p_std = _stats(press)
-    h_min, h_max, h_mean, h_std = _stats(hum)
+    gas_min, gas_max, gas_mean = _stats(gas)
+    t_min, t_max, t_mean = _stats(temp)
+    p_min, p_max, p_mean = _stats(press)
+    h_min, h_max, h_mean = _stats(hum)
+    gas_std = compute_standard_deviation(gas_arr=gas_arr)
+    area = calculate_area_fixed_segments(gas_arr=gas)
+    peaks, valleys = find_peaks_segment(gas_arr=gas_arr)
 
-    total_peaks_down, total_peaks_up =_compute_peaks(gas=gas, millis=millis, threshold_pct=threshold_pct)
-    # recovery_area_oms_seconds = compute_recovery_area(gas_arr=gas, millis_arr=millis)
-    # drop_area_oms_seconds = compute_drop_area(gas_arr=gas, millis_arr=millis, baseline=gas_mean)
-    slope_recovery = compute_slope_recovery(gas_arr=gas, millis_arr=millis)
-    slope_drop = compute_slope_drop(gas_arr=gas, millis_arr=millis)
     feature_names = [
         "sensor_id",
-        "gas_min", "gas_max", "gas_mean", "gas_std",
-        "temperature_min", "temperature_max", "temperature_mean", "temperature_std",
-        "pressure_min", "pressure_max", "pressure_mean", "pressure_std",
-        "humidity_min", "humidity_max", "humidity_mean", "humidity_std",
-        "total_peaks_up", "total_peaks_down",
-        "slope_drop",
-        "slope_recovery"
+        "gas_min", "gas_max", "gas_mean",
+        "temperature_min", "temperature_max", "temperature_mean", 
+        "pressure_min", "pressure_max", "pressure_mean", 
+        "humidity_min", "humidity_max", "humidity_mean", 
+        "gas_std",
+        "area",
+        "peaks",
+        "valleys"
     ]
     
     vals = [
         sensor_id,
-        gas_min, gas_max, gas_mean, gas_std,
-        t_min, t_max, t_mean, t_std,
-        p_min, p_max, p_mean, p_std,
-        h_min, h_max, h_mean, h_std,
-        float(total_peaks_up), float(total_peaks_down),
-        slope_drop,
-        slope_recovery
+        gas_min, gas_max, gas_mean,
+        t_min, t_max, t_mean, 
+        p_min, p_max, p_mean, 
+        h_min, h_max, h_mean,
+        gas_std,
+        area,
+        peaks,
+        valleys
     ]
     
 
-    return np.array(vals, dtype=float), feature_names
+    return np.array(vals, dtype=object), feature_names
+
+if __name__ == "__main__":
+    import pandas as pd
+    import sys
+
+    # if len(sys.argv) < 2:
+    #     print("Usage: python features.py <csv_file>")
+    #     sys.exit(1)
+
+    # csv_file = sys.argv[1]
+
+    # Load CSV
+    df = pd.read_csv("teste3.csv")
+    
+    # Keep everything that is NOT in bad_ids
+    df = df[~df["id"].isin([765269850, 765286747, 765279836, 765271387, 765283665, 765268824, 765287253])]
+
+    # Expected columns: gas, temperature, pressure, humidity, millis
+    gas = df["gas_resistance"].values if "gas_resistance" in df else []
+    temp = df["temperature"].values if "temperature" in df else []
+    press = df["pressure"].values if "pressure" in df else []
+    hum = df["humidity"].values if "humidity" in df else []
+    millis = df["millis"].values if "millis" in df else []
+
+    # for d in df['gas_resistance']:
+    #     print(d)
+
+    features, names = extract_features(
+            sensor_id=765270362,
+            gas_arr=gas,
+            temp_arr=temp,
+            pressure_arr=press,
+            humidity_arr=hum,
+            millis_arr=millis,
+            threshold_pct=0.20
+    )
+    
+    print("\nExtracted Features:")
+    for n, v in zip(names, features):
+        if isinstance(v, (list, np.ndarray)):
+            v_str = ", ".join(f"{x:.2f}" for x in v)
+            print(f"{n:20s}: [{v_str}]")
+        else:
+            print(f"{n:20s}: {v:.2f}")
 
